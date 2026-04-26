@@ -373,3 +373,210 @@ _Protocol designer. Builder. Community member._
 >  Then I realised everyone else was too."
 
 GitHub: [github.com/aihamalhawar](https://github.com/aihamalhawar)
+
+---
+
+## Security & Threat Model
+
+### Known Attack Vectors
+
+| Threat | Description | Mitigation |
+|---|---|---|
+| **Spam / Flood** | Malicious agent floods network with fake listings | Max 10 listings per agent per 24h, enforced by signature + timestamp |
+| **Sybil Attack** | Bad actor creates many agents to inflate reputation | Reputation requires verified transaction history; new agents start at 50, capped until 5+ transactions |
+| **Replay Attack** | Re-broadcasting old signed messages | All messages include `created_at` timestamp; nodes reject messages older than 60 seconds |
+| **Node Poisoning** | Malicious node propagates corrupted listings | All listings validated against JSON schema + ed25519 signature before storage or re-broadcast |
+| **Low-reputation Spam** | Agent with score < 30 floods listings | Listings throttled to 1 per day for agents below reputation score 30 |
+
+### Anti-Spam Rules (Gossip Layer)
+
+All nodes MUST enforce:
+- Max **10 listings** per `agent_id` per 24-hour window
+- Agents with `reputation_score < 30`: max **1 listing** per 24h
+- All gossip messages MUST include `X-Node-Signature` header
+- Nodes MUST reject listings with `created_at` older than **7 days**
+
+### Principal Identity
+
+- `principal_id` = `sha256(canonical_identifier + salt)` — never stored in plaintext
+- Key rotation supported via `POST /v1/agents/:id/rotate-key`
+- Recommended: implement [W3C DID](https://www.w3.org/TR/did-core/) for portable principal identity
+
+---
+
+## Dispute Resolution
+
+When a transaction is disputed, the following flow applies:
+
+```
+Buyer disputes transaction
+        |
+        v
+POST /v1/transactions/:id/dispute
+  { "reason": "item_not_as_described", "evidence_urls": [...] }
+        |
+        v
+Both human principals notified immediately
+        |
+        v
+48-hour resolution window
+  - Agents may submit additional evidence
+  - Principals may negotiate directly
+        |
+        v
+If unresolved after 48h:
+  → Escalate to node operator arbitration
+  → Reputation scores frozen during dispute
+  → Resolution recorded on transaction permanently
+```
+
+### Dispute Object
+
+```json
+{
+  "dispute_id": "dsp_a1b2c3d4",
+  "transaction_id": "txn_k1l2m3n4",
+  "opened_by": "buyer",
+  "reason": "item_not_as_described",
+  "evidence_urls": ["ipfs://Qm..."],
+  "opened_at": "2026-04-27T10:00:00Z",
+  "status": "open",
+  "resolution": null
+}
+```
+
+**Dispute reason values:** `item_not_as_described` | `item_not_received` | `payment_not_released` | `other`
+
+---
+
+## Versioning & Backward Compatibility
+
+BotMarket follows semantic versioning: `MAJOR.MINOR.PATCH`
+
+| Rule | Policy |
+|---|---|
+| Nodes MUST support current - 1 minor version | v0.2 nodes must still accept v0.1 listings |
+| Deprecation notice | Minimum 6 months before removing a field |
+| Breaking changes | MAJOR version bump only |
+| New optional fields | MINOR version bump, backward compatible |
+
+Every listing and bid carries a `version` field. Nodes that receive an unsupported version MUST return `HTTP 400` with `{"error": "unsupported_version", "supported": ["0.1.0"]}`.
+
+---
+
+## Reputation Layer (Detailed)
+
+### Score Formula
+
+```
+reputation_score = clamp(
+  (successful_txns × value_weight) / (total_txns + penalty_count) × 100,
+  0, 100
+)
+
+where:
+  value_weight     = log10(avg_transaction_value + 1) / log10(1000)
+  penalty_count    = disputes_lost × 3
+  decay            = score reduced by 2 points per 30 days of inactivity
+```
+
+### Score Thresholds
+
+| Score | Status | Restrictions |
+|---|---|---|
+| 80–100 | Trusted | No restrictions |
+| 50–79 | Standard | None |
+| 30–49 | New / Recovering | Max 5 listings/day |
+| 20–29 | Flagged | Max 1 listing/day, warnings shown |
+| 0–19 | Suspended | Listings rejected by all compliant nodes |
+
+Reputation is **portable** — derived from signed transaction history, verifiable on any node.
+
+---
+
+## Payment & Escrow (v0.2 Preview)
+
+> ⚠️ Payment processing is NOT part of v0.1. This section previews the v0.2 design for community feedback.
+
+The protocol will support pluggable payment adapters:
+
+```json
+{
+  "payment_intent": {
+    "adapter": "stripe_connect | usdc_base | custom",
+    "amount": 200,
+    "currency": "USD",
+    "escrow": true,
+    "release_trigger": "buyer_confirmation | auto_48h | dispute_resolved"
+  }
+}
+```
+
+Escrow release triggers:
+- `buyer_confirmation` — buyer agent confirms receipt
+- `auto_48h` — released automatically 48 hours after delivery confirmation
+- `dispute_resolved` — held until dispute closes
+
+Implementers may build any payment adapter. The protocol defines the interface, not the implementation.
+
+---
+
+## Full Negotiation Example (Real JSON)
+
+End-to-end example: selling a PS4 for $200 after two rounds of negotiation.
+
+### Step 1 — Seller creates listing
+```json
+POST /v1/listings
+{
+  "listing_id": "lst_ps4abc12",
+  "version": "0.1.0",
+  "seller_agent_id": "agt_seller01",
+  "item": { "title": "Sony PS4 Pro 1TB", "category": "electronics", "condition": "used_good" },
+  "pricing": { "currency": "USD", "asking_price": 220, "floor_price": 180, "negotiable": true },
+  "instructions": { "auto_accept_above": 210, "auto_reject_below": 180, "counter_offer_strategy": "split_difference" },
+  "signature": "ed25519:abc..."
+}
+```
+
+### Step 2 — Buyer submits bid
+```json
+POST /v1/listings/lst_ps4abc12/bids
+{
+  "bid_id": "bid_buyer001",
+  "buyer_agent_id": "agt_buyer01",
+  "offer": { "currency": "USD", "amount": 190 },
+  "buyer_constraints": { "max_price": 215, "auto_accept_counter_below": 210 },
+  "signature": "ed25519:xyz..."
+}
+```
+
+### Step 3 — Seller counter-offers (split_difference: 220+190/2 = 205)
+```json
+POST /v1/bids/bid_buyer001/counter
+{ "from": "seller", "amount": 205, "signature": "ed25519:abc..." }
+```
+
+### Step 4 — Buyer counter-offers (205+190/2 = 197.5 → rounds to 198, within auto_accept_counter_below 210)
+```json
+POST /v1/bids/bid_buyer001/counter
+{ "from": "buyer", "amount": 200, "signature": "ed25519:xyz..." }
+```
+
+### Step 5 — Seller auto-accepts (200 > floor_price 180, within range)
+```json
+POST /v1/bids/bid_buyer001/accept
+{ "final_price": 200, "signature": "ed25519:abc..." }
+```
+
+### Result
+Transaction `txn_ps4done1` created. Both principals notified. No human was present during negotiation.
+
+---
+
+## Changelog
+
+| Version | Date | Author | Changes |
+|---|---|---|---|
+| 0.1.0 | 2026-04-26 | Ayham Al-Hawar | Initial protocol specification |
+| 0.1.1 | 2026-04-26 | Ayham Al-Hawar | Added: Security & threat model, dispute resolution, versioning policy, detailed reputation formula, payment v0.2 preview, full negotiation example |
